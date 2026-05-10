@@ -1,15 +1,35 @@
 import type { ServerWebSocket, Socket } from "bun";
 import { z } from "zod";
+import { createLogger } from "./logger";
 
 // Environment validation schema
 const envSchema = z.object({
   UUID: z.string().uuid("UUID must be a valid UUID v4 format"),
   PROXYIP: z.string().optional().default(""),
   PORT: z.coerce.number().int().min(1).max(65535).optional().default(3000),
+  LOG_LEVEL: z.string().optional().default("info"),
+  /** Advertised host for subscription URLs (override Host header) */
+  PUBLIC_HOST: z.string().optional().default(""),
+  /** Advertised port for subscription URLs (override Host / PORT) */
+  PUBLIC_PORT: z.preprocess(
+    (v) => (v === undefined || v === "" ? undefined : v),
+    z.coerce.number().int().min(1).max(65535).optional()
+  ),
+  /**
+   * Generate `security=tls` / `wss` URLs for clients (use when TLS terminates on reverse proxy).
+   * Default false matches plain Bun server / Docker (HTTP + WS on PORT).
+   */
+  TLS: z.preprocess((v) => {
+    if (v === undefined || v === "") return false;
+    const s = String(v).toLowerCase();
+    return s === "true" || s === "1" || s === "yes";
+  }, z.boolean()),
 });
 
 // Validate and parse environment variables
 const env = envSchema.parse(process.env);
+
+const log = createLogger(env.LOG_LEVEL);
 
 // Configuration
 const userID = env.UUID;
@@ -101,7 +121,7 @@ function safeCloseWebSocket(socket: ServerWebSocket<WSData>): void {
       socket.close();
     }
   } catch (error) {
-    console.error("safeCloseWebSocket error", error);
+    log.error("safeCloseWebSocket error", error);
   }
 }
 
@@ -116,16 +136,16 @@ interface VlessHeader {
   isUDP?: boolean;
 }
 
-function processVlessHeader(vlessBuffer: ArrayBuffer, userID: string): VlessHeader {
-  if (vlessBuffer.byteLength < 24) {
+function processVlessHeader(vless: Uint8Array, userID: string): VlessHeader {
+  if (vless.byteLength < 24) {
     return { hasError: true, message: "invalid data" };
   }
 
-  const version = new Uint8Array(vlessBuffer.slice(0, 1));
+  const version = vless.subarray(0, 1);
   let isValidUser = false;
   let isUDP = false;
 
-  if (stringify(new Uint8Array(vlessBuffer.slice(1, 17))) === userID) {
+  if (stringify(vless.subarray(1, 17)) === userID) {
     isValidUser = true;
   }
 
@@ -133,10 +153,8 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, userID: string): VlessHead
     return { hasError: true, message: "invalid user" };
   }
 
-  const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
-  const command = new Uint8Array(
-    vlessBuffer.slice(18 + optLength, 18 + optLength + 1)
-  )[0];
+  const optLength = vless[17];
+  const command = vless[18 + optLength];
 
   if (command === 1) {
     // TCP
@@ -150,39 +168,58 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, userID: string): VlessHead
   }
 
   const portIndex = 18 + optLength + 1;
-  const portBuffer = vlessBuffer.slice(portIndex, portIndex + 2);
-  const portRemote = new DataView(portBuffer).getUint16(0);
+  if (portIndex + 2 > vless.byteLength) {
+    return { hasError: true, message: "truncated VLESS header (port)" };
+  }
+  const portRemote = new DataView(vless.buffer, vless.byteOffset + portIndex, 2).getUint16(0);
 
   let addressIndex = portIndex + 2;
-  const addressBuffer = new Uint8Array(
-    vlessBuffer.slice(addressIndex, addressIndex + 1)
-  );
+  if (addressIndex >= vless.byteLength) {
+    return { hasError: true, message: "truncated VLESS header (address type)" };
+  }
 
-  const addressType = addressBuffer[0];
+  const addressType = vless[addressIndex];
   let addressLength = 0;
   let addressValueIndex = addressIndex + 1;
   let addressValue = "";
 
   switch (addressType) {
-    case 1: // IPv4
+    case 1: {
+      // IPv4
       addressLength = 4;
-      addressValue = new Uint8Array(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+      if (addressValueIndex + addressLength > vless.byteLength) {
+        return { hasError: true, message: "truncated VLESS header (IPv4)" };
+      }
+      addressValue = Array.from(
+        vless.subarray(addressValueIndex, addressValueIndex + addressLength)
       ).join(".");
       break;
-    case 2: // Domain
-      addressLength = new Uint8Array(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + 1)
-      )[0];
+    }
+    case 2: {
+      // Domain
+      if (addressValueIndex >= vless.byteLength) {
+        return { hasError: true, message: "truncated VLESS header (domain len)" };
+      }
+      addressLength = vless[addressValueIndex];
       addressValueIndex += 1;
+      if (addressValueIndex + addressLength > vless.byteLength) {
+        return { hasError: true, message: "truncated VLESS header (domain)" };
+      }
       addressValue = new TextDecoder().decode(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+        vless.subarray(addressValueIndex, addressValueIndex + addressLength)
       );
       break;
-    case 3: // IPv6
+    }
+    case 3: {
+      // IPv6
       addressLength = 16;
+      if (addressValueIndex + addressLength > vless.byteLength) {
+        return { hasError: true, message: "truncated VLESS header (IPv6)" };
+      }
       const dataView = new DataView(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+        vless.buffer,
+        vless.byteOffset + addressValueIndex,
+        addressLength
       );
       const ipv6: string[] = [];
       for (let i = 0; i < 8; i++) {
@@ -190,6 +227,7 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, userID: string): VlessHead
       }
       addressValue = ipv6.join(":");
       break;
+    }
     default:
       return { hasError: true, message: `invalid addressType is ${addressType}` };
   }
@@ -289,17 +327,18 @@ async function handleUDPOutBound(
     write: async (chunk: Uint8Array) => {
       // Parse UDP packets from chunk
       for (let index = 0; index < chunk.byteLength; ) {
-        const lengthBuffer = chunk.slice(index, index + 2);
-        const udpPacketLength = new DataView(lengthBuffer.buffer).getUint16(0);
-        const udpData = chunk.slice(index + 2, index + 2 + udpPacketLength);
-        index = index + 2 + udpPacketLength;
+        if (index + 2 > chunk.byteLength) break;
+        const udpPacketLength = (chunk[index] << 8) | chunk[index + 1];
+        if (index + 2 + udpPacketLength > chunk.byteLength) break;
+        const udpData = chunk.subarray(index + 2, index + 2 + udpPacketLength);
+        index += 2 + udpPacketLength;
 
         // DNS over HTTPS query
         try {
           const resp = await fetch("https://1.1.1.1/dns-query", {
             method: "POST",
             headers: { "content-type": "application/dns-message" },
-            body: udpData,
+            body: Buffer.from(udpData),
           });
           
           const dnsQueryResult = await resp.arrayBuffer();
@@ -339,31 +378,79 @@ async function handleUDPOutBound(
   };
 }
 
-function getVLESSConfig(userID: string, hostName: string): string {
-  const vlessMain = `vless://${userID}@${hostName}:443?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
+function splitHostPort(hostHeader: string): { host: string; port: number | undefined } {
+  const raw = hostHeader.trim();
+  if (!raw) return { host: "localhost", port: undefined };
+
+  if (raw.startsWith("[")) {
+    const endBracket = raw.indexOf("]");
+    if (endBracket === -1) return { host: raw, port: undefined };
+    const inner = raw.slice(1, endBracket);
+    const rest = raw.slice(endBracket + 1);
+    if (rest.startsWith(":")) {
+      const p = Number.parseInt(rest.slice(1), 10);
+      return { host: inner, port: Number.isFinite(p) ? p : undefined };
+    }
+    return { host: inner, port: undefined };
+  }
+
+  const colon = raw.lastIndexOf(":");
+  if (colon > 0 && /^\d+$/.test(raw.slice(colon + 1))) {
+    const p = Number.parseInt(raw.slice(colon + 1), 10);
+    return { host: raw.slice(0, colon), port: Number.isFinite(p) ? p : undefined };
+  }
+
+  return { host: raw, port: undefined };
+}
+
+/** Host portion for `user@host:port` when host may be IPv6 */
+function hostForUri(hostname: string): string {
+  if (hostname.includes(":") && !hostname.startsWith("[")) {
+    return `[${hostname}]`;
+  }
+  return hostname;
+}
+
+function getVLESSConfig(userID: string, hostHeader: string): string {
+  const parsed = splitHostPort(hostHeader);
+  const advertiseHost = env.PUBLIC_HOST.trim() || parsed.host;
+  const advertisePort = env.PUBLIC_PORT ?? parsed.port ?? PORT;
+  const useTls = env.TLS;
+
+  const serverInUri = hostForUri(advertiseHost);
+  const pathEnc = encodeURIComponent("/?ed=2048");
+  const wsHostParam = advertiseHost;
+
+  const vlessMain = useTls
+    ? `vless://${userID}@${serverInUri}:${advertisePort}?encryption=none&security=tls&type=ws&sni=${encodeURIComponent(advertiseHost)}&fp=randomized&host=${encodeURIComponent(wsHostParam)}&path=${pathEnc}#${encodeURIComponent(advertiseHost)}`
+    : `vless://${userID}@${serverInUri}:${advertisePort}?encryption=none&security=none&type=ws&host=${encodeURIComponent(wsHostParam)}&path=${pathEnc}#${encodeURIComponent(advertiseHost)}`;
+
+  const clashTls = useTls;
+  const clashSni = useTls ? `  sni: ${advertiseHost}\n  client-fingerprint: chrome\n` : "";
+
   return `
 ################################################################
-v2ray
+v2ray / v2rayN — import as VLESS (match TLS to server: TLS=${useTls})
 ---------------------------------------------------------------
 ${vlessMain}
 ---------------------------------------------------------------
+Docker / plain WS: set client transport TLS off, port ${advertisePort}.
+Behind nginx/Caddy with TLS: set TLS=true in server env and use wss + TLS in client.
 ################################################################
 clash-meta
 ---------------------------------------------------------------
 - type: vless
-  name: ${hostName}
-  server: ${hostName}
-  port: 443
+  name: ${advertiseHost}
+  server: ${advertiseHost}
+  port: ${advertisePort}
   uuid: ${userID}
   network: ws
-  tls: true
+  tls: ${clashTls}
   udp: false
-  sni: ${hostName}
-  client-fingerprint: chrome
-  ws-opts:
+${clashSni}  ws-opts:
     path: "/?ed=2048"
     headers:
-      host: ${hostName}
+      host: ${advertiseHost}
 ---------------------------------------------------------------
 ################################################################
 `;
@@ -374,9 +461,6 @@ async function handleWebSocketMessage(
   message: Buffer | ArrayBuffer | Uint8Array
 ): Promise<void> {
   const data = ws.data;
-  const log = (info: string, event?: string) => {
-    console.log(`[${data.address}:${data.portWithRandomLog}] ${info}`, event || "");
-  };
 
   let chunk: Uint8Array;
   if (message instanceof Buffer) {
@@ -399,7 +483,7 @@ async function handleWebSocketMessage(
     return;
   }
 
-  // Process VLESS header for new connection
+  // Process VLESS header for new connection (must use the same Uint8Array view as the message)
   const {
     hasError,
     message: errorMessage,
@@ -408,13 +492,16 @@ async function handleWebSocketMessage(
     rawDataIndex = 0,
     vlessVersion = new Uint8Array([0, 0]),
     isUDP,
-  } = processVlessHeader(chunk.buffer, userID);
+  } = processVlessHeader(chunk, userID);
 
   data.address = addressRemote;
   data.portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? "udp" : "tcp"}`;
 
+  const sessionLog = (msg: string, meta?: unknown) =>
+    log.debug(`[${data.address}:${data.portWithRandomLog}] ${msg}`, meta);
+
   if (hasError) {
-    log("VLESS header error", errorMessage);
+    sessionLog("VLESS header error", errorMessage);
     throw new Error(errorMessage);
   }
 
@@ -428,10 +515,10 @@ async function handleWebSocketMessage(
   }
 
   const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0]);
-  const rawClientData = new Uint8Array(chunk.buffer.slice(rawDataIndex));
+  const rawClientData = chunk.subarray(rawDataIndex);
 
   if (data.isDns) {
-    const { write } = await handleUDPOutBound(ws, vlessResponseHeader, log);
+    const { write } = await handleUDPOutBound(ws, vlessResponseHeader, sessionLog);
     data.udpStreamWrite = write;
     data.udpStreamWrite(rawClientData);
     return;
@@ -443,7 +530,7 @@ async function handleWebSocketMessage(
     portRemote,
     rawClientData,
     vlessResponseHeader,
-    log
+    sessionLog
   );
 }
 
@@ -505,19 +592,18 @@ const server = Bun.serve<WSData>({
 
   websocket: {
     open(ws) {
-      const log = (info: string) => console.log(`[WS] ${info}`);
-      log("WebSocket connection opened");
+      log.debug("[WS] WebSocket connection opened");
 
       // Handle early data (0-RTT)
       const { earlyData, error } = base64ToArrayBuffer(ws.data.earlyData);
       if (error) {
-        log(`Early data error: ${error}`);
+        log.warn("[WS] Early data decode error", String(error));
         ws.close();
         return;
       }
       if (earlyData) {
         handleWebSocketMessage(ws, new Uint8Array(earlyData)).catch((err) => {
-          log(`Early data processing error: ${err}`);
+          log.warn("[WS] Early data processing error", String(err));
           ws.close();
         });
       }
@@ -527,20 +613,13 @@ const server = Bun.serve<WSData>({
       try {
         await handleWebSocketMessage(ws, message as Buffer);
       } catch (err) {
-        console.error("WebSocket message error:", err);
+        log.error("WebSocket message error", err);
         safeCloseWebSocket(ws);
       }
     },
 
-    close(ws) {
-      console.log("[WS] Connection closed");
-      if (ws.data.remoteSocket.value) {
-        ws.data.remoteSocket.value.end();
-      }
-    },
-
-    error(ws, error) {
-      console.error("[WS] Error:", error);
+    close(ws, code, reason) {
+      log.debug(`[WS] Connection closed code=${code}`, reason);
       if (ws.data.remoteSocket.value) {
         ws.data.remoteSocket.value.end();
       }
@@ -548,5 +627,5 @@ const server = Bun.serve<WSData>({
   },
 });
 
-console.log(`VLESS Bun server running on port ${PORT}`);
-console.log(`Config URL: http://localhost:${PORT}/${userID}`);
+log.info(`VLESS Bun server listening on port ${PORT}`);
+log.info(`Config URL (replace host with your Docker/WSL IP): http://0.0.0.0:${PORT}/${userID}`);
