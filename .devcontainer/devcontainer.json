@@ -23,9 +23,9 @@
 
   "remoteUser": "root",
 
-  "postCreateCommand": "bun install --frozen-lockfile || bun install",
+  "postCreateCommand": "chmod +x .devcontainer/setup-deps.sh .devcontainer/start.sh && sh .devcontainer/setup-deps.sh",
 
-  "postStartCommand": "sh .devcontainer/start.sh",
+  "postStartCommand": "chmod +x .devcontainer/setup-deps.sh .devcontainer/start.sh && sh .devcontainer/start.sh",
 
   "customizations": {
     "vscode": {
