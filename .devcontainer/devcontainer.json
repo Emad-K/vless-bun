@@ -1,0 +1,37 @@
+{
+  "name": "vless-bun",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+
+  "forwardPorts": [443],
+  "portsAttributes": {
+    "443": {
+      "label": "VLESS Bun (HTTP/WS)",
+      "onAutoForward": "notify",
+      "visibility": "public"
+    }
+  },
+
+  "containerEnv": {
+    "PORT": "443"
+  },
+
+  "remoteUser": "root",
+
+  "postCreateCommand": "bun install --frozen-lockfile || bun install",
+
+  "postStartCommand": "sh .devcontainer/start.sh",
+
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "sh"
+      }
+    }
+  }
+}

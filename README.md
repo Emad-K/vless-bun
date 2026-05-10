@@ -39,6 +39,10 @@ docker build -t vless-bun .
 docker run -p 3000:3000 --env-file .env vless-bun
 ```
 
+### GitHub Codespaces
+
+The [Dev Container](https://containers.dev/) in `.devcontainer/` sets `PORT=443`, forwards port **443** (labeled **public**), runs as **root** so binding to `443` works without extra capabilities, and starts **`bun run dev`** on each container start via `.devcontainer/start.sh`. Create a codespace from the repo; after it opens, check the **Ports** tab for the forwarded URL (still plain HTTP/WebSocket on that port, not TLS termination inside the app).
+
 ## Configuration
 
 Edit `.env` file:
