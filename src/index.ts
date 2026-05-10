@@ -1,6 +1,12 @@
 import type { ServerWebSocket, Socket } from "bun";
 import { z } from "zod";
 import { createLogger } from "./logger";
+import {
+  buildSocks5ConnectRequest,
+  buildSocks5UserPassAuth,
+  parseSocksEndpoint,
+  socks5ConnectReplyLength,
+} from "./socks5";
 
 // Environment validation schema
 const envSchema = z.object({
@@ -33,8 +39,10 @@ const log = createLogger(env.LOG_LEVEL);
 
 // Configuration
 const userID = env.UUID;
-const proxyIP = env.PROXYIP;
 const PORT = env.PORT;
+
+/** When set, all outbound TCP exits through this SOCKS5 proxy (RFC 1928). */
+const socksEndpoint = env.PROXYIP.trim() ? parseSocksEndpoint(env.PROXYIP) : null;
 
 // WebSocket data interface
 interface WSData {
@@ -256,64 +264,207 @@ async function handleTCPOutBound(
   portRemote: number,
   rawClientData: Uint8Array,
   vlessResponseHeader: Uint8Array,
-  log: (info: string, event?: string) => void
+  sessionLog: (info: string, event?: string) => void
 ): Promise<void> {
   let vlessHeader: Uint8Array | null = vlessResponseHeader;
 
-  async function connectAndWrite(address: string, port: number): Promise<Socket> {
-    log(`Connecting to ${address}:${port}`);
-    
-    const tcpSocket = await Bun.connect({
-      hostname: address,
-      port: port,
+  const relayToClient = (data: ArrayBuffer | Uint8Array) => {
+    if (ws.readyState !== WS_READY_STATE_OPEN) {
+      return;
+    }
+    const buf = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (vlessHeader) {
+      const combined = new Uint8Array(vlessHeader.length + buf.length);
+      combined.set(vlessHeader);
+      combined.set(buf, vlessHeader.length);
+      ws.send(combined);
+      vlessHeader = null;
+    } else {
+      ws.send(buf);
+    }
+  };
+
+  const onTcpClosed = () => {
+    sessionLog("TCP connection closed");
+    safeCloseWebSocket(ws);
+  };
+
+  if (socksEndpoint) {
+    let handshakeBuf = new Uint8Array(0);
+    let phase: "method" | "auth" | "connect" = "method";
+    let handshakeDone = false;
+
+    const needsUserPass =
+      Boolean(socksEndpoint.username) && socksEndpoint.password !== undefined;
+
+    const appendHandshake = (chunk: ArrayBuffer | Uint8Array) => {
+      const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+      const next = new Uint8Array(handshakeBuf.length + u8.length);
+      next.set(handshakeBuf);
+      next.set(u8, handshakeBuf.length);
+      handshakeBuf = next;
+    };
+
+    await Bun.connect({
+      hostname: socksEndpoint.hostname,
+      port: socksEndpoint.port,
       socket: {
+        open(socket) {
+          sessionLog(`SOCKS5 → ${socksEndpoint.hostname}:${socksEndpoint.port}`);
+          // RFC 1928: with credentials, offer both no-auth (0x00) and USER/PASS (0x02)
+          if (needsUserPass) {
+            socket.write(new Uint8Array([5, 2, 0, 2]));
+          } else {
+            socket.write(new Uint8Array([5, 1, 0]));
+          }
+        },
         data(socket, data) {
-          if (ws.readyState !== WS_READY_STATE_OPEN) {
+          if (handshakeDone) {
+            relayToClient(data);
             return;
           }
-          
-          if (vlessHeader) {
-            const combined = new Uint8Array(vlessHeader.length + data.length);
-            combined.set(vlessHeader);
-            combined.set(new Uint8Array(data), vlessHeader.length);
-            ws.send(combined);
-            vlessHeader = null;
-          } else {
-            ws.send(data);
-          }
-        },
-        open(socket) {
-          log(`Connected to ${address}:${port}`);
-          socket.write(rawClientData);
-        },
-        close(socket) {
-          log("TCP connection closed");
-          safeCloseWebSocket(ws);
-        },
-        error(socket, error) {
-          log("TCP connection error", String(error));
-          safeCloseWebSocket(ws);
-        },
-        connectError(socket, error) {
-          log("TCP connect error", String(error));
-          // Try retry with proxyIP
-          if (proxyIP && address !== proxyIP) {
-            connectAndWrite(proxyIP, port).catch((err) => {
-              log("Retry failed", String(err));
+          appendHandshake(data);
+          while (!handshakeDone) {
+            if (phase === "method") {
+              if (handshakeBuf.length < 2) return;
+              const ver = handshakeBuf[0];
+              const method = handshakeBuf[1];
+              handshakeBuf = handshakeBuf.subarray(2);
+              if (ver !== 5) {
+                sessionLog("SOCKS5 bad version", String(ver));
+                safeCloseWebSocket(ws);
+                return;
+              }
+              if (method === 255) {
+                sessionLog("SOCKS5 no acceptable auth method", "close proxy or add credentials");
+                safeCloseWebSocket(ws);
+                return;
+              }
+              if (method === 2) {
+                if (!needsUserPass) {
+                  sessionLog(
+                    "SOCKS5 server requires username/password",
+                    "set PROXYIP=user:pass@host:port"
+                  );
+                  safeCloseWebSocket(ws);
+                  return;
+                }
+                try {
+                  socket.write(
+                    buildSocks5UserPassAuth(
+                      socksEndpoint.username!,
+                      socksEndpoint.password ?? ""
+                    )
+                  );
+                } catch (e) {
+                  sessionLog("SOCKS5 user/pass build error", String(e));
+                  safeCloseWebSocket(ws);
+                  return;
+                }
+                phase = "auth";
+                continue;
+              }
+              if (method === 0) {
+                try {
+                  socket.write(buildSocks5ConnectRequest(addressRemote, portRemote));
+                } catch (e) {
+                  sessionLog("SOCKS5 CONNECT request error", String(e));
+                  safeCloseWebSocket(ws);
+                  return;
+                }
+                phase = "connect";
+                continue;
+              }
+              sessionLog("SOCKS5 unsupported method", String(method));
               safeCloseWebSocket(ws);
-            });
-          } else {
-            safeCloseWebSocket(ws);
+              return;
+            }
+            if (phase === "auth") {
+              if (handshakeBuf.length < 2) return;
+              const ver = handshakeBuf[0];
+              const status = handshakeBuf[1];
+              handshakeBuf = handshakeBuf.subarray(2);
+              if (ver !== 1 || status !== 0) {
+                sessionLog("SOCKS5 username/password failed", `ver=${ver} status=${status}`);
+                safeCloseWebSocket(ws);
+                return;
+              }
+              try {
+                socket.write(buildSocks5ConnectRequest(addressRemote, portRemote));
+              } catch (e) {
+                sessionLog("SOCKS5 CONNECT request error", String(e));
+                safeCloseWebSocket(ws);
+                return;
+              }
+              phase = "connect";
+              continue;
+            }
+            if (phase === "connect") {
+              const replyLen = socks5ConnectReplyLength(handshakeBuf);
+              if (replyLen === null) return;
+              const rep = handshakeBuf[1];
+              if (rep !== 0) {
+                sessionLog("SOCKS5 CONNECT rejected", `REP=${rep}`);
+                safeCloseWebSocket(ws);
+                return;
+              }
+              handshakeBuf = handshakeBuf.subarray(replyLen);
+              handshakeDone = true;
+              ws.data.remoteSocket.value = socket;
+              sessionLog(`SOCKS5 tunneled → ${addressRemote}:${portRemote}`);
+              socket.write(rawClientData);
+              if (handshakeBuf.length > 0) {
+                const rest = handshakeBuf;
+                handshakeBuf = new Uint8Array(0);
+                relayToClient(rest);
+              }
+              return;
+            }
           }
+        },
+        close() {
+          onTcpClosed();
+        },
+        error(_socket, error) {
+          sessionLog("SOCKS5 relay error", String(error));
+          safeCloseWebSocket(ws);
+        },
+        connectError(_socket, error) {
+          sessionLog("SOCKS5 proxy unreachable", String(error));
+          safeCloseWebSocket(ws);
         },
       },
     });
 
-    ws.data.remoteSocket.value = tcpSocket;
-    return tcpSocket;
+    return;
   }
 
-  await connectAndWrite(addressRemote, portRemote);
+  const tcpSocket = await Bun.connect({
+    hostname: addressRemote,
+    port: portRemote,
+    socket: {
+      data(_socket, data) {
+        relayToClient(data);
+      },
+      open(socket) {
+        sessionLog(`Connected to ${addressRemote}:${portRemote}`);
+        socket.write(rawClientData);
+      },
+      close() {
+        onTcpClosed();
+      },
+      error(_socket, error) {
+        sessionLog("TCP connection error", String(error));
+        safeCloseWebSocket(ws);
+      },
+      connectError(_socket, error) {
+        sessionLog("TCP connect error", String(error));
+        safeCloseWebSocket(ws);
+      },
+    },
+  });
+
+  ws.data.remoteSocket.value = tcpSocket;
 }
 
 async function handleUDPOutBound(
@@ -628,4 +779,8 @@ const server = Bun.serve<WSData>({
 });
 
 log.info(`VLESS Bun server listening on port ${PORT}`);
+if (socksEndpoint) {
+  const userHint = socksEndpoint.username ? ` user=${socksEndpoint.username}` : "";
+  log.info(`Outbound TCP exits via SOCKS5 at ${socksEndpoint.hostname}:${socksEndpoint.port}${userHint}`);
+}
 log.info(`Config URL (replace host with your Docker/WSL IP): http://0.0.0.0:${PORT}/${userID}`);

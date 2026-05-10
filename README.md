@@ -46,7 +46,7 @@ Edit `.env` file:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `UUID` | Your unique VLESS UUID | `4c1fe881-420d-4c23-8b26-5bb66101687b` |
-| `PROXYIP` | Fallback proxy IP (optional) | empty |
+| `PROXYIP` | SOCKS5 `host`, `host:port`, or `user:password@host:port` (default port 1080). Password may contain `:` (split after first `:`). Outbound TCP exits through this proxy. | empty |
 | `PORT` | Server port | `3000` |
 
 ## Usage
