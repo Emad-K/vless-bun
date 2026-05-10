@@ -43,7 +43,7 @@ docker run -p 3000:3000 --env-file .env vless-bun
 
 The [Dev Container](https://containers.dev/) in `.devcontainer/` sets `PORT=443`, forwards port **443** (labeled **public**), runs as **root** so binding to `443` works without extra capabilities, and starts **`bun run dev`** on each container start via `.devcontainer/start.sh`.
 
-Dependencies (`zod`, etc.) are **`bun install`’d while the Docker image is built** (where registry access works) and stored under `/deps` in the image; `setup-deps.sh` symlinks `/workspace/node_modules` to that tree so the bind-mounted repo does not need a working `bun install` at runtime (which often hits `ConnectionRefused` inside restricted codespaces). After you change `package.json` or `bun.lock`, run **Dev Containers: Rebuild Container** so the image is rebuilt and deps refresh.
+Dependencies (`zod`, etc.) are **`bun install`’d while the Docker image is built** (where registry access works) and stored under `/deps` in the image; `setup-deps.sh` symlinks the repo’s `node_modules` to that tree so the bind-mounted project does not need a working `bun install` at runtime (which often hits `ConnectionRefused` inside restricted codespaces). After you change `package.json` or `bun.lock`, run **Dev Containers: Rebuild Container** so the image is rebuilt and deps refresh.
 
 Create a codespace from the repo; after it opens, check the **Ports** tab for the forwarded URL (still plain HTTP/WebSocket on that port, not TLS termination inside the app).
 
